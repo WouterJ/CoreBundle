@@ -36,6 +36,11 @@ class TwigExtension extends \Twig_Extension
         }
     }
 
+    /**
+     * Get list of available functions
+     *
+     * @return array
+     */
     public function getFunctions()
     {
         $functions = array('cmf_is_published' => new \Twig_Function_Method($this, 'isPublished'));
@@ -46,6 +51,8 @@ class TwigExtension extends \Twig_Extension
             $functions['cmf_prev'] = new \Twig_Function_Method($this, 'prev');
             $functions['cmf_next'] = new \Twig_Function_Method($this, 'next');
             $functions['cmf_find'] = new \Twig_Function_Method($this, 'find');
+            $functions['cmf_find_many'] = new \Twig_Function_Method($this, 'findMany');
+            $functions['cmf_descendants'] = new \Twig_Function_Method($this, 'descendants');
             $functions['cmf_nodename'] = new \Twig_Function_Method($this, 'getNodeName');
             $functions['cmf_parent_path'] = new \Twig_Function_Method($this, 'getParentPath');
             $functions['cmf_path'] = new \Twig_Function_Method($this, 'getPath');
@@ -61,51 +68,119 @@ class TwigExtension extends \Twig_Extension
         return $functions;
     }
 
+    /**
+     * @param object $document
+     * @return string
+     */
     public function getNodeName($document)
     {
         return PathHelper::getNodeName($this->getPath($document));
     }
 
+    /**
+     * @param object $document
+     * @return string
+     */
     public function getParentPath($document)
     {
         return PathHelper::getParentPath($this->getPath($document));
     }
 
+    /**
+     * @param object $document
+     * @return string
+     */
     public function getPath($document)
     {
+        if (!is_object($document) || !$this->dm->contains($document)) {
+            return null;
+        }
+
         return $this->dm->getUnitOfWork()->getDocumentId($document);
     }
 
+    /**
+     * @param string|object $parent parent path/document
+     * @param string $name
+     * @return null|object
+     */
     public function child($parent, $name)
     {
-        $parentId = $this->dm->getUnitOfWork()->getDocumentId($parent);
-        return $this->dm->find(null, $parentId.'/'.$name);
-    }
+        if (is_object($parent)) {
+            $parent = $this->dm->getUnitOfWork()->getDocumentId($parent);
+        }
 
-    public function childrenLinkable($parent, $limit = false, $ignoreRole = false, $filter = null)
-    {
-        return $this->children($parent, $limit, $ignoreRole, $filter, 'Symfony\Cmf\Component\Routing\RouteAwareInterface');
+        return $this->dm->find(null, "$parent/$name");
     }
 
     /**
-     * @param object $parent parent document
-     * @param int|bool $limit int limit or false
-     * @param string|bool $offset string node name to which to skip to or false
-     * @param bool|null $ignoreRole boolean if the role should be ignored or null if publish workflow should be ignored
-     * @param string|null $filter child filter
-     * @param string|null $class class name to filter on
+     * Get a document instance and validate if its eligible
+     *
+     * @param string|object $document
+     * @param Boolean $ignoreRole
+     * @param null|string $class
+     * @return null|object
+     */
+    private function getDocument($document, $ignoreRole = false, $class = null)
+    {
+        if (is_string($document)) {
+            $document = $this->dm->find(null, $document);
+        }
+
+        if (null === $ignoreRole || !$this->publishWorkflowChecker->checkIsPublished($document, $ignoreRole)
+            || (null != $class && !($document instanceof $class))
+        ) {
+            return null;
+        }
+
+        return $document;
+    }
+
+    /**
+     * Get linkable child documents
+     *
+     * @param string|object $parent parent path/document
+     * @param int|Boolean $limit int limit or false
+     * @param string|Boolean $offset string node name to which to skip to or false
+     * @param null|string $filter child filter
+     * @param Boolean|null $ignoreRole if the role should be ignored or null if publish workflow should be ignored
+     * @param null|string $class class name to filter on
      * @return array
      */
-    public function children($parent, $limit = false, $offset = false, $ignoreRole = false, $filter = null, $class = null)
+    public function childrenLinkable($parent, $limit = false, $offset = false, $filter = null, $ignoreRole = false, $class = null)
+    {
+        $class = $class ?: 'Symfony\Cmf\Component\Routing\RouteAwareInterface';
+        return $this->children($parent, $limit, $offset, $filter, $ignoreRole, $class);
+    }
+
+    /**
+     * Get child documents
+     *
+     * @param string|object $parent parent path/document
+     * @param int|Boolean $limit int limit or false
+     * @param string|Boolean $offset string node name to which to skip to or false
+     * @param null|string $filter child filter
+     * @param Boolean|null $ignoreRole if the role should be ignored or null if publish workflow should be ignored
+     * @param null|string $class class name to filter on
+     * @return array
+     */
+    public function children($parent, $limit = false, $offset = false, $filter = null, $ignoreRole = false, $class = null)
     {
         if (empty($parent)) {
             return array();
         }
 
         if ($limit || $offset) {
-            $parentId = $this->dm->getUnitOfWork()->getDocumentId($parent);
-            $node = $this->dm->getPhpcrSession()->getNode($parentId);
+            if (is_object($parent)) {
+                $parent = $this->dm->getUnitOfWork()->getDocumentId($parent);
+            }
+            $node = $this->dm->getPhpcrSession()->getNode($parent);
             $children = (array) $node->getNodeNames();
+            foreach ($children as $key => $child) {
+                if (strpos($child, 'phpcr_locale:') === 0) {
+                    unset($children[$key]);
+                }
+            }
             if ($offset) {
                 $key = array_search($offset, $children);
                 if (false === $key) {
@@ -118,14 +193,13 @@ class TwigExtension extends \Twig_Extension
         }
 
         $result = array();
-        foreach ($children as $child) {
-            if ($limit !== false || $offset !== false) {
-                $child = $this->dm->find(null, "$parentId/$child");
+        foreach ($children as $name => $child) {
+            if (strpos($name, 'phpcr_locale:') === 0) {
+                continue;
             }
 
-            if (null === $ignoreRole || !$this->publishWorkflowChecker->checkIsPublished($child, $ignoreRole)
-                || (null != $class && !($child instanceof $class))
-            ) {
+            $child = $this->getDocument($child, $ignoreRole, $class);
+            if (null === $child) {
                 continue;
             }
 
@@ -141,36 +215,119 @@ class TwigExtension extends \Twig_Extension
         return $result;
     }
 
-    private function search($current, $reverse = false, $class = null)
+    /**
+     * Get the paths of children
+     *
+     * @param string $path
+     * @param array $children
+     * @param integer $depth
+     */
+    private function getChildrenPaths($path, array &$children, $depth)
     {
-        if (empty($current)) {
-            return null;
+        if (null !== $depth && $depth < 1) {
+            return;
         }
 
-        $path = $this->dm->getUnitOfWork()->getDocumentId($current);
+        --$depth;
+
         $node = $this->dm->getPhpcrSession()->getNode($path);
-        $parent = $node->getParent();
-        $childNames = $parent->getNodeNames();
+        $names = (array) $node->getNodeNames();
+        foreach ($names as $name) {
+            if (strpos($name, 'phpcr_locale:') === 0) {
+                continue;
+            }
+
+            $children[] = $child = "$path/$name";
+            $this->getChildrenPaths($child, $children, $depth);
+        }
+    }
+
+    /**
+     * @param string|object $parent parent path/document
+     * @param null|int $depth null denotes no limit, depth of 1 means direct children only etc.
+     * @return array
+     */
+    public function descendants($parent, $depth = null)
+    {
+        if (empty($parent)) {
+            return array();
+        }
+
+        $children = array();
+        if (is_object($parent)) {
+            $parent = $this->dm->getUnitOfWork()->getDocumentId($parent);
+        }
+        $this->getChildrenPaths($parent, $children, $depth);
+
+        return $children;
+    }
+
+    /**
+     * @param array $paths list of paths
+     * @param int|Boolean $limit int limit or false
+     * @param string|Boolean $offset string node name to which to skip to or false
+     * @param Boolean|null $ignoreRole if the role should be ignored or null if publish workflow should be ignored
+     * @param null|string $class class name to filter on
+     * @return array
+     */
+    public function findMany($paths = array(), $limit = false, $offset = false, $ignoreRole = false, $class = null)
+    {
+        if ($offset) {
+            $paths = array_slice($paths, $offset);
+        }
+
+        $result = array();
+        foreach ($paths as $path) {
+            $document = $this->getDocument($path, $ignoreRole, $class);
+            if (null === $document) {
+                continue;
+            }
+
+            $result[] = $document;
+            if (false !== $limit) {
+                $limit--;
+                if (!$limit) {
+                    break;
+                }
+            }
+        }
+
+        return $result;
+    }
+
+    /**
+     * Check children for a possible following document
+     *
+     * @param Traversable $childNames
+     * @param Boolean $reverse
+     * @param string $parentPath
+     * @param Boolean $ignoreRole
+     * @param null|string $class
+     * @param null|string $nodeName
+     * @return null|object
+     */
+    private function checkChildren($childNames, $reverse, $parentPath, $ignoreRole = false, $class = null, $nodeName = null)
+    {
         if ($reverse) {
             $childNames = array_reverse($childNames->getArrayCopy());
         }
 
-        $check = false;
+        $check = empty($nodeName);
         foreach ($childNames as $name) {
+            if (strpos($name, 'phpcr_locale:') === 0) {
+                continue;
+            }
+
             if ($check) {
                 try {
-                    $child = $this->dm->find(null, $parent->getPath().'/'.$name);
-                    if ($this->publishWorkflowChecker->checkIsPublished($child)
-                        && (null === $class || $child instanceof $class)
-                    ) {
+                    $child = $this->getDocument("$parentPath/$name", $ignoreRole, $class);
+                    if ($child) {
                         return $child;
                     }
                 } catch (MissingTranslationException $e) {
                     continue;
                 }
-            }
-
-            if ($node->getName() == $name) {
+            } elseif ($nodeName == $name) {
                 $check = true;
             }
         }
@@ -178,26 +335,143 @@ class TwigExtension extends \Twig_Extension
         return null;
     }
 
-    public function prev($current)
+
+    /**
+     * Search for a following document
+     *
+     * @param string|object $path document instance or path
+     * @param string|object $anchor document instance or path
+     * @param null|integer $depth
+     * @param Boolean $reverse
+     * @param Boolean $ignoreRole
+     * @param null|string $class
+     * @return null|object
+     */
+    private function search($path, $anchor = null, $depth = null, $reverse = false, $ignoreRole = false, $class = null)
     {
-        return $this->search($current, true);
+        if (empty($path)) {
+            return null;
+        }
+
+        if (is_object($path)) {
+            $path = $this->dm->getUnitOfWork()->getDocumentId($path);
+        }
+
+        $node = $this->dm->getPhpcrSession()->getNode($path);
+
+        if ($anchor) {
+            if (is_object($anchor)) {
+                $anchor = $this->dm->getUnitOfWork()->getDocumentId($anchor);
+            }
+
+            if (strpos($path, $anchor) !== 0) {
+                throw new \RuntimeException("The anchor path '$anchor' is not a parent of the current path '$path'.");
+            }
+
+            if (!$reverse
+                // TODO should substr_count($path, '/') be moved into the PathHelper?
+                && (null === $depth || (substr_count($path, '/') - substr_count($anchor, '/')) < $depth)
+            ) {
+                $childNames = $node->getNodeNames();
+
+                if ($childNames->count()) {
+                    $result = $this->checkChildren($childNames, $reverse, $path, $ignoreRole, $class);
+                    if ($result) {
+                        return $result;
+                    }
+                }
+            }
+        }
+
+        $nodename = $node->getName();
+
+        do {
+            $parentNode = $node->getParent();
+            $childNames = $parentNode->getNodeNames();
+            $result = $this->checkChildren($childNames, $reverse, $parentNode->getPath(), $ignoreRole, $class, $nodename);
+            if ($result || !$anchor) {
+                return $result;
+            }
+
+            $node = $parentNode;
+            if ($nodename) {
+                $reverse = !$reverse;
+                $nodename = null;
+            }
+        } while (!$anchor || $anchor !== $node->getPath());
+
+        return null;
     }
 
-    public function next($current)
+    /**
+     * Get the previous document
+     *
+     * @param string|object $current document instance or path
+     * @param string|object $parent document instance or path
+     * @param null|integer $depth
+     * @param Boolean $ignoreRole
+     * @param null|string $class
+     * @return null|object
+     */
+    public function prev($current, $parent = null, $depth = null, $ignoreRole = false, $class = null)
     {
-        return $this->search($current);
+        return $this->search($current, $parent, $depth, true, $ignoreRole, $class);
     }
 
-    public function prevLinkable($current)
+    /**
+     * Get the next document
+     *
+     * @param string|object $current document instance or path
+     * @param string|object $parent document instance or path
+     * @param null|integer $depth
+     * @param Boolean $ignoreRole
+     * @param null|string $class
+     * @return null|object
+     */
+    public function next($current, $parent = null, $depth = null, $ignoreRole = false, $class = null)
     {
-        return $this->search($current, true, 'Symfony\Cmf\Component\Routing\RouteAwareInterface');
+        return $this->search($current, $parent, $depth, false, $ignoreRole, $class);
     }
 
-    public function nextLinkable($current)
+
+    /**
+     * Get the previous linkable document
+     *
+     * @param string|object $current document instance or path
+     * @param string|object $parent document instance or path
+     * @param null|integer $depth
+     * @param Boolean $ignoreRole
+     * @param null|string $class
+     * @return null|object
+     */
+    public function prevLinkable($current, $parent = null, $depth = null, $ignoreRole = false, $class = null)
     {
-        return $this->search($current, false, 'Symfony\Cmf\Component\Routing\RouteAwareInterface');
+        $class = $class ?: 'Symfony\Cmf\Component\Routing\RouteAwareInterface';
+        return $this->search($current, $parent, $depth, true, $ignoreRole, $class);
     }
 
+    /**
+     * Get the next linkable document
+     *
+     * @param string|object $current document instance or path
+     * @param string|object $parent document instance or path
+     * @param null|integer $depth
+     * @param Boolean $ignoreRole
+     * @param null|string $class
+     * @return null|object
+     */
+    public function nextLinkable($current, $parent = null, $depth = null, $ignoreRole = false, $class = null)
+    {
+        $class = $class ?: 'Symfony\Cmf\Component\Routing\RouteAwareInterface';
+        return $this->search($current, $parent, $depth, false, $ignoreRole, $class);
+    }
+
+    /**
+     * Check if a document is published
+     *
+     * @param $document
+     * @return Boolean
+     */
     public function isPublished($document)
     {
         if (empty($document)) {
@@ -207,18 +481,35 @@ class TwigExtension extends \Twig_Extension
         return $this->publishWorkflowChecker->checkIsPublished($document, true);
     }
 
+    /**
+     * Find a document by path
+     *
+     * @param $path
+     * @return null|object
+     */
     public function find($path)
     {
         return $this->dm->find(null, $path);
     }
 
+    /**
+     * Get the locales of the document
+     *
+     * @param string|object $document document instance or path
+     * @param Boolean $includeFallbacks
+     * @return array
+     */
     public function getLocalesFor($document, $includeFallbacks = false)
     {
-        try {
-            if (empty($document)) {
-                return array();
-            }
+        if (empty($document)) {
+            return array();
+        }
 
+        if (is_string($document)) {
+            $document = $this->dm->find(null, $document);
+        }
+
+        try {
             $locales = $this->dm->getLocalesFor($document, $includeFallbacks);
         } catch (MissingTranslationException $e) {
             $locales = array();
@@ -227,6 +518,11 @@ class TwigExtension extends \Twig_Extension
         return $locales;
     }
 
+    /**
+     * Get the extension name
+     *
+     * @return string
+     */
     public function getName()
     {
         return 'children_extension';
